@@ -1,4 +1,6 @@
-# k6 SDET Performance Testing Framework
+# k6 Performance Testing Framework
+
+**Author:** Abhishek
 
 A production-grade, code-first performance testing suite built on [k6](https://k6.io) with real-time observability, SLO-tied thresholds, baseline regression detection, and full CI/CD integration.
 

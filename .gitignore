@@ -1,0 +1,26 @@
+# Test results — generated at runtime, never commit
+results/
+reports/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# Node (if k6 bundling added later)
+node_modules/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# Secrets — should never exist in the repo, but safety net
+.env
+.env.*
+*.secret

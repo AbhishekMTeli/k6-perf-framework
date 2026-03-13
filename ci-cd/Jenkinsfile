@@ -1,0 +1,188 @@
+/**
+ * Jenkins pipeline for k6 performance tests.
+ *
+ * Mirrors the GitHub Actions workflow for teams on on-premise Jenkins.
+ * Designed for post-deploy integration: triggered by upstream deploy jobs.
+ */
+
+pipeline {
+    agent { label 'perf-runner' }
+
+    parameters {
+        choice(name: 'SCENARIO',    choices: ['load', 'stress', 'spike', 'soak'], description: 'Test scenario')
+        choice(name: 'TARGET_ENV',  choices: ['staging', 'production'],            description: 'Target environment')
+        string(name: 'LOAD_RATE',   defaultValue: '50',  description: 'Requests per second (load scenario)')
+        string(name: 'LOAD_DURATION', defaultValue: '600', description: 'Test duration in seconds')
+        booleanParam(name: 'BASELINE_CHECK', defaultValue: true, description: 'Run baseline regression check')
+        booleanParam(name: 'FAIL_ON_REGRESSION', defaultValue: true, description: 'Fail build on threshold/baseline breach')
+    }
+
+    triggers {
+        // Nightly at 1 AM
+        cron('0 1 * * *')
+        // Trigger after staging deploy succeeds
+        upstream(upstreamProjects: 'deploy-staging', threshold: hudson.model.Result.SUCCESS)
+    }
+
+    environment {
+        STAGING_BASE_URL = credentials('staging-base-url')
+        STAGING_USER     = credentials('staging-perf-user')
+        STAGING_PASS     = credentials('staging-perf-pass')
+        PROD_BASE_URL    = credentials('prod-base-url')
+        PROD_USER        = credentials('prod-perf-user')
+        PROD_PASS        = credentials('prod-perf-pass')
+        RUN_DIR          = "results/run_${BUILD_NUMBER}"
+        K6_NO_USAGE_REPORT = 'true'
+    }
+
+    options {
+        timeout(time: 2, unit: 'HOURS')
+        buildDiscarder(logRotator(numToKeepStr: '20'))
+        disableConcurrentBuilds(abortPrevious: false)  // Never abort running perf tests
+        timestamps()
+        ansiColor('xterm')
+    }
+
+    stages {
+        stage('Pre-flight') {
+            steps {
+                script {
+                    sh 'which k6 || (echo "[ERROR] k6 not installed on agent" && exit 1)'
+                    sh 'which python3 || (echo "[ERROR] python3 not installed on agent" && exit 1)'
+                    sh 'k6 version'
+                    echo "[setup] Scenario: ${params.SCENARIO} | Env: ${params.TARGET_ENV} | Build: #${BUILD_NUMBER}"
+                }
+            }
+        }
+
+        stage('Health Check') {
+            steps {
+                script {
+                    def targetUrl = params.TARGET_ENV == 'production'
+                        ? env.PROD_BASE_URL
+                        : env.STAGING_BASE_URL
+
+                    def status = sh(
+                        script: "curl -sf -o /dev/null -w '%{http_code}' ${targetUrl}/api/health",
+                        returnStdout: true
+                    ).trim()
+
+                    if (status != '200') {
+                        error "[health-check] Target ${targetUrl} returned ${status}. Aborting."
+                    }
+
+                    echo "[health-check] Target healthy (HTTP ${status})"
+                }
+            }
+        }
+
+        stage('Run Performance Test') {
+            steps {
+                sh """
+                    mkdir -p ${RUN_DIR}
+
+                    BASELINE_FLAG=""
+                    if [ "${params.BASELINE_CHECK}" = "true" ]; then
+                        BASELINE_FLAG="--baseline"
+                    fi
+
+                    LOAD_RATE=${params.LOAD_RATE} \\
+                    LOAD_DURATION=${params.LOAD_DURATION} \\
+                    ./scripts/run.sh \\
+                        --scenario ${params.SCENARIO} \\
+                        --env ${params.TARGET_ENV} \\
+                        --output-dir ${RUN_DIR} \\
+                        \$BASELINE_FLAG
+                """
+            }
+            post {
+                always {
+                    archiveArtifacts artifacts: "${RUN_DIR}/**", allowEmptyArchive: true
+                }
+            }
+        }
+
+        stage('Publish Report') {
+            steps {
+                script {
+                    publishHTML(target: [
+                        allowMissing: true,
+                        alwaysLinkToLastBuild: false,
+                        keepAll: true,
+                        reportDir: "${RUN_DIR}",
+                        reportFiles: 'k6_stdout.log',
+                        reportName: "k6 Run Log — #${BUILD_NUMBER}",
+                    ])
+
+                    def summaryFile = "${RUN_DIR}/summary.json"
+                    if (fileExists(summaryFile)) {
+                        def summary = readJSON file: summaryFile
+                        def m = summary.metrics ?: [:]
+
+                        def p95 = m['http_req_duration']?.values?.get('p(95)') ?: 'N/A'
+                        def p99 = m['http_req_duration']?.values?.get('p(99)') ?: 'N/A'
+                        def errRate = m['http_req_failed']?.values?.get('rate') ?: 'N/A'
+                        def rps = m['http_reqs']?.values?.get('rate') ?: 'N/A'
+
+                        currentBuild.description = "P95:${p95}ms | ERR:${errRate} | RPS:${rps}"
+
+                        echo """
+========================================
+ Performance Summary — Build #${BUILD_NUMBER}
+ Scenario:     ${params.SCENARIO}
+ Env:          ${params.TARGET_ENV}
+ P95:          ${p95}ms  (SLO: <500ms staging / <300ms prod)
+ P99:          ${p99}ms  (SLO: <1000ms staging / <500ms prod)
+ Error Rate:   ${errRate}
+ Throughput:   ${rps} req/s
+========================================"""
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+        success {
+            slackSend(
+                channel: '#performance-tests',
+                color: 'good',
+                message: """:white_check_mark: *Performance test PASSED* — Build #${BUILD_NUMBER}
+Scenario: `${params.SCENARIO}` | Env: `${params.TARGET_ENV}`
+${BUILD_URL}"""
+            )
+        }
+
+        failure {
+            slackSend(
+                channel: '#performance-alerts',
+                color: 'danger',
+                message: """:red_circle: *Performance test FAILED* — Build #${BUILD_NUMBER}
+Scenario: `${params.SCENARIO}` | Env: `${params.TARGET_ENV}`
+${BUILD_URL}"""
+            )
+            emailext(
+                subject: "PERF FAILED: ${params.SCENARIO} on ${params.TARGET_ENV} — Build #${BUILD_NUMBER}",
+                body: "See build: ${BUILD_URL}",
+                recipientProviders: [[$class: 'DevelopersRecipientProvider']],
+                to: '${DEFAULT_RECIPIENTS}'
+            )
+        }
+
+        unstable {
+            slackSend(
+                channel: '#performance-tests',
+                color: 'warning',
+                message: """:warning: *Performance test UNSTABLE* — Build #${BUILD_NUMBER}
+Scenario: `${params.SCENARIO}` | Env: `${params.TARGET_ENV}`
+${BUILD_URL}"""
+            )
+        }
+
+        always {
+            cleanWs(patterns: [
+                [pattern: "${RUN_DIR}/**", type: 'EXCLUDE']
+            ])
+        }
+    }
+}

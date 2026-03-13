@@ -1,0 +1,290 @@
+name: Performance Testing Pipeline
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+  schedule:
+    # Run nightly at 2 AM UTC
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+    inputs:
+      test_type:
+        description: 'Test type to run'
+        required: true
+        default: 'load'
+        type: choice
+        options:
+          - load
+          - stress
+          - spike
+      threads:
+        description: 'Number of concurrent users'
+        required: false
+        default: '50'
+      duration:
+        description: 'Test duration in seconds'
+        required: false
+        default: '300'
+      target_env:
+        description: 'Target environment'
+        required: true
+        default: 'staging'
+        type: choice
+        options:
+          - staging
+          - production
+
+env:
+  JMETER_VERSION: '5.6.3'
+  JMETER_HOME: /opt/jmeter
+  REPORT_DIR: reports
+  RESULTS_DIR: results
+
+jobs:
+  # ──────────────────────────────────────────────
+  # Job 1: Setup and validate test configuration
+  # ──────────────────────────────────────────────
+  validate:
+    name: Validate Test Plans
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Cache JMeter
+        id: cache-jmeter
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.JMETER_HOME }}
+          key: jmeter-${{ env.JMETER_VERSION }}
+
+      - name: Install JMeter
+        if: steps.cache-jmeter.outputs.cache-hit != 'true'
+        run: |
+          wget -q https://downloads.apache.org/jmeter/binaries/apache-jmeter-${{ env.JMETER_VERSION }}.tgz
+          tar -xzf apache-jmeter-${{ env.JMETER_VERSION }}.tgz
+          sudo mv apache-jmeter-${{ env.JMETER_VERSION }} ${{ env.JMETER_HOME }}
+
+      - name: Install JMeter Plugins
+        run: |
+          # Download plugins manager
+          wget -q https://jmeter-plugins.org/get/ -O ${{ env.JMETER_HOME }}/lib/ext/jmeter-plugins-manager.jar
+          # Download cmd runner
+          wget -q https://search.maven.org/remotecontent?filepath=kg/apc/cmdrunner/2.3/cmdrunner-2.3.jar \
+            -O ${{ env.JMETER_HOME }}/lib/cmdrunner-2.3.jar
+          # Install Concurrency Thread Group plugin (required for spike tests)
+          java -jar ${{ env.JMETER_HOME }}/lib/cmdrunner-2.3.jar \
+            --tool org.jmeterplugins.repository.PluginManagerCMD \
+            install jpgc-casutg,jpgc-graphs-basic,jpgc-synthesis \
+            --pluginspath ${{ env.JMETER_HOME }}/lib/ext/ || true
+
+      - name: Validate JMX files
+        run: |
+          for jmx in test-plans/*.jmx; do
+            echo "Validating: $jmx"
+            ${{ env.JMETER_HOME }}/bin/jmeter -n -t "$jmx" --loglevel WARN -X \
+              -Jjmeter.save.saveservice.output_format=csv \
+              -Dbase_url=localhost -Dport=9999 \
+              -Dthreads=1 -Dramp_up=1 -Dduration=5 2>&1 | head -20 || true
+          done
+          echo "Validation complete"
+
+  # ──────────────────────────────────────────────
+  # Job 2: Run Performance Tests
+  # ──────────────────────────────────────────────
+  performance-test:
+    name: Run ${{ github.event.inputs.test_type || 'load' }} Test
+    runs-on: ubuntu-latest
+    needs: validate
+    environment:
+      name: ${{ github.event.inputs.target_env || 'staging' }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Java 11
+        uses: actions/setup-java@v4
+        with:
+          java-version: '11'
+          distribution: 'temurin'
+
+      - name: Cache JMeter
+        id: cache-jmeter
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.JMETER_HOME }}
+          key: jmeter-${{ env.JMETER_VERSION }}
+
+      - name: Install JMeter
+        if: steps.cache-jmeter.outputs.cache-hit != 'true'
+        run: |
+          wget -q https://downloads.apache.org/jmeter/binaries/apache-jmeter-${{ env.JMETER_VERSION }}.tgz
+          tar -xzf apache-jmeter-${{ env.JMETER_VERSION }}.tgz
+          sudo mv apache-jmeter-${{ env.JMETER_VERSION }} ${{ env.JMETER_HOME }}
+          chmod +x ${{ env.JMETER_HOME }}/bin/jmeter
+
+      - name: Create output directories
+        run: mkdir -p ${{ env.RESULTS_DIR }} ${{ env.REPORT_DIR }}
+
+      - name: Set test parameters
+        id: params
+        run: |
+          TEST_TYPE="${{ github.event.inputs.test_type || 'load' }}"
+          THREADS="${{ github.event.inputs.threads || '50' }}"
+          DURATION="${{ github.event.inputs.duration || '300' }}"
+          TARGET_ENV="${{ github.event.inputs.target_env || 'staging' }}"
+
+          # Map environment to base URL
+          if [ "$TARGET_ENV" = "production" ]; then
+            BASE_URL="${{ secrets.PROD_BASE_URL }}"
+            PORT="443"
+            PROTOCOL="https"
+          else
+            BASE_URL="${{ secrets.STAGING_BASE_URL || 'api.staging.example.com' }}"
+            PORT="443"
+            PROTOCOL="https"
+          fi
+
+          echo "test_type=$TEST_TYPE" >> $GITHUB_OUTPUT
+          echo "threads=$THREADS" >> $GITHUB_OUTPUT
+          echo "duration=$DURATION" >> $GITHUB_OUTPUT
+          echo "base_url=$BASE_URL" >> $GITHUB_OUTPUT
+          echo "port=$PORT" >> $GITHUB_OUTPUT
+          echo "protocol=$PROTOCOL" >> $GITHUB_OUTPUT
+          echo "timestamp=$(date +%Y%m%d_%H%M%S)" >> $GITHUB_OUTPUT
+
+      - name: Run JMeter Load Test
+        run: |
+          ${{ env.JMETER_HOME }}/bin/jmeter \
+            -n \
+            -t test-plans/performance-test-plan.jmx \
+            -l ${{ env.RESULTS_DIR }}/results_${{ steps.params.outputs.timestamp }}.jtl \
+            -e -o ${{ env.REPORT_DIR }}/html \
+            -Jbase_url=${{ steps.params.outputs.base_url }} \
+            -Jport=${{ steps.params.outputs.port }} \
+            -Jthreads=${{ steps.params.outputs.threads }} \
+            -Jramp_up=30 \
+            -Jduration=${{ steps.params.outputs.duration }} \
+            -Jjmeter.save.saveservice.output_format=csv \
+            -Jjmeter.save.saveservice.response_code=true \
+            -Jjmeter.save.saveservice.latency=true \
+            -Jjmeter.save.saveservice.timestamp_format=ms \
+            --loglevel WARN \
+            2>&1 | tee ${{ env.RESULTS_DIR }}/jmeter.log
+
+      - name: Parse and validate results
+        id: results
+        run: |
+          RESULTS_FILE="${{ env.RESULTS_DIR }}/results_${{ steps.params.outputs.timestamp }}.jtl"
+
+          # Extract key metrics from JTL
+          python3 scripts/parse_results.py "$RESULTS_FILE" > ${{ env.RESULTS_DIR }}/metrics.json
+
+          # Read thresholds
+          ERROR_RATE=$(python3 -c "import json; d=json.load(open('${{ env.RESULTS_DIR }}/metrics.json')); print(d['error_rate'])")
+          AVG_RT=$(python3 -c "import json; d=json.load(open('${{ env.RESULTS_DIR }}/metrics.json')); print(d['avg_response_time'])")
+          P95_RT=$(python3 -c "import json; d=json.load(open('${{ env.RESULTS_DIR }}/metrics.json')); print(d['p95_response_time'])")
+
+          echo "error_rate=$ERROR_RATE" >> $GITHUB_OUTPUT
+          echo "avg_rt=$AVG_RT" >> $GITHUB_OUTPUT
+          echo "p95_rt=$P95_RT" >> $GITHUB_OUTPUT
+
+          # Validate against thresholds
+          python3 scripts/validate_thresholds.py \
+            --error-rate "$ERROR_RATE" \
+            --avg-rt "$AVG_RT" \
+            --p95-rt "$P95_RT" \
+            --max-error-rate 2.0 \
+            --max-avg-rt 2000 \
+            --max-p95-rt 5000
+
+      - name: Upload HTML report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: jmeter-html-report-${{ steps.params.outputs.timestamp }}
+          path: ${{ env.REPORT_DIR }}/html
+          retention-days: 30
+
+      - name: Upload JTL results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: jmeter-jtl-${{ steps.params.outputs.timestamp }}
+          path: ${{ env.RESULTS_DIR }}
+          retention-days: 30
+
+      - name: Post results to PR comment
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const errorRate = '${{ steps.results.outputs.error_rate }}';
+            const avgRt = '${{ steps.results.outputs.avg_rt }}';
+            const p95Rt = '${{ steps.results.outputs.p95_rt }}';
+
+            const status = parseFloat(errorRate) < 2.0 ? '✅ PASSED' : '❌ FAILED';
+
+            const body = `## Performance Test Results ${status}
+
+            | Metric | Value | Threshold |
+            |--------|-------|-----------|
+            | Error Rate | ${errorRate}% | < 2.0% |
+            | Avg Response Time | ${avgRt}ms | < 2000ms |
+            | 95th Percentile | ${p95Rt}ms | < 5000ms |
+            | Concurrent Users | ${{ steps.params.outputs.threads }} | - |
+            | Test Duration | ${{ steps.params.outputs.duration }}s | - |
+
+            [View Full HTML Report](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})
+            `;
+
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: body
+            });
+
+      - name: Notify Slack on failure
+        if: failure()
+        uses: slackapi/slack-github-action@v1.26.0
+        with:
+          channel-id: ${{ secrets.SLACK_CHANNEL_ID }}
+          slack-message: |
+            :red_circle: *Performance Test FAILED* on `${{ github.ref_name }}`
+            *Error Rate:* ${{ steps.results.outputs.error_rate }}%
+            *P95 Response Time:* ${{ steps.results.outputs.p95_rt }}ms
+            *Run:* ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+
+  # ──────────────────────────────────────────────
+  # Job 3: Publish Results (on main branch only)
+  # ──────────────────────────────────────────────
+  publish-results:
+    name: Publish Performance Trends
+    runs-on: ubuntu-latest
+    needs: performance-test
+    if: github.ref == 'refs/heads/main' && always()
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: jmeter-jtl-*
+          merge-multiple: true
+          path: results/
+
+      - name: Deploy HTML Report to GitHub Pages
+        uses: peaceiris/actions-gh-pages@v4
+        if: success()
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: reports/html
+          destination_dir: performance-reports/${{ github.run_number }}

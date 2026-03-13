@@ -1,0 +1,263 @@
+name: Performance Tests
+
+on:
+  push:
+    branches: [main, develop]
+    paths:
+      - 'k6/**'
+      - 'scripts/**'
+      - '.github/workflows/perf.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'k6/**'
+  schedule:
+    # Nightly load test on staging — 2 AM UTC
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+    inputs:
+      scenario:
+        description: 'Test scenario'
+        required: true
+        default: 'load'
+        type: choice
+        options: [load, stress, spike, soak]
+      target_env:
+        description: 'Target environment'
+        required: true
+        default: 'staging'
+        type: choice
+        options: [staging, production]
+      load_rate:
+        description: 'Requests per second (load scenario)'
+        required: false
+        default: '50'
+      baseline_check:
+        description: 'Run baseline regression check'
+        required: false
+        default: true
+        type: boolean
+
+# Prevent concurrent runs against the same environment
+concurrency:
+  group: perf-${{ github.event.inputs.target_env || 'staging' }}
+  cancel-in-progress: false  # Never cancel in-progress perf tests — partial data is misleading
+
+jobs:
+  # ─────────────────────────────────────────────
+  # Job 1: Validate k6 scripts (fast, on every PR)
+  # ─────────────────────────────────────────────
+  validate:
+    name: Validate k6 Scripts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup k6
+        uses: grafana/setup-k6-action@v1
+
+      - name: Lint — dry-run all scenarios
+        env:
+          TARGET_ENV: local
+          K6_NO_USAGE_REPORT: 'true'
+        run: |
+          for scenario in k6/src/scenarios/*.js; do
+            echo "Validating: $scenario"
+            # --dry-run not available in all versions; use --vus 0 --duration 0s
+            k6 run --no-usage-report \
+              -e TARGET_ENV=local \
+              --vus 0 \
+              --duration 0s \
+              "$scenario" || true
+          done
+
+  # ─────────────────────────────────────────────
+  # Job 2: Run performance tests
+  # ─────────────────────────────────────────────
+  run-perf-tests:
+    name: Performance Test (${{ github.event.inputs.scenario || 'load' }} / ${{ github.event.inputs.target_env || 'staging' }})
+    runs-on: ubuntu-latest
+    needs: validate
+    # Only run full tests on: main branch push, nightly schedule, or manual trigger
+    # Skip on feature branch PRs (validation is enough there)
+    if: |
+      github.event_name == 'schedule' ||
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'push' && github.ref == 'refs/heads/main')
+
+    env:
+      SCENARIO: ${{ github.event.inputs.scenario || 'load' }}
+      TARGET_ENV: ${{ github.event.inputs.target_env || 'staging' }}
+      LOAD_RATE: ${{ github.event.inputs.load_rate || '50' }}
+      RUN_BASELINE: ${{ github.event.inputs.baseline_check || 'true' }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup k6
+        uses: grafana/setup-k6-action@v1
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Restore baseline history
+        uses: actions/cache@v4
+        with:
+          path: results/baseline_history.json
+          key: baseline-history-${{ env.TARGET_ENV }}-${{ env.SCENARIO }}
+          restore-keys: |
+            baseline-history-${{ env.TARGET_ENV }}-${{ env.SCENARIO }}
+
+      - name: Run performance test
+        env:
+          STAGING_BASE_URL: ${{ secrets.STAGING_BASE_URL }}
+          STAGING_USER: ${{ secrets.STAGING_USER }}
+          STAGING_PASS: ${{ secrets.STAGING_PASS }}
+          PROD_BASE_URL: ${{ secrets.PROD_BASE_URL }}
+          PROD_USER: ${{ secrets.PROD_USER }}
+          PROD_PASS: ${{ secrets.PROD_PASS }}
+          K6_NO_USAGE_REPORT: 'true'
+        run: |
+          mkdir -p results
+
+          BASELINE_FLAG=""
+          if [[ "$RUN_BASELINE" == "true" ]]; then
+            BASELINE_FLAG="--baseline"
+          fi
+
+          ./scripts/run.sh \
+            --scenario "$SCENARIO" \
+            --env "$TARGET_ENV" \
+            --output-dir "results/run_${{ github.run_number }}" \
+            $BASELINE_FLAG
+
+      - name: Parse summary for PR comment
+        if: always()
+        id: parse_summary
+        run: |
+          SUMMARY="results/run_${{ github.run_number }}/summary.json"
+          if [[ -f "$SUMMARY" ]]; then
+            python3 - <<'EOF'
+          import json, os, sys
+
+          with open("results/run_${{ github.run_number }}/summary.json") as f:
+              data = json.load(f)
+
+          m = data.get("metrics", {})
+
+          def stat(metric, field):
+              return m.get(metric, {}).get("values", {}).get(field, "N/A")
+
+          def fmt_ms(v):
+              return f"{v:.0f}ms" if isinstance(v, (int, float)) else v
+
+          def fmt_pct(v):
+              return f"{v*100:.3f}%" if isinstance(v, (int, float)) else v
+
+          lines = [
+              "## Performance Test Results",
+              f"**Scenario:** ${{ env.SCENARIO }} | **Env:** ${{ env.TARGET_ENV }} | **Run:** #${{ github.run_number }}",
+              "",
+              "| Metric | Value | SLO |",
+              "|--------|-------|-----|",
+              f"| Avg Response Time | {fmt_ms(stat('http_req_duration', 'avg'))} | < 200ms |",
+              f"| P95 Response Time | {fmt_ms(stat('http_req_duration', 'p(95)'))} | < 500ms |",
+              f"| P99 Response Time | {fmt_ms(stat('http_req_duration', 'p(99)'))} | < 1000ms |",
+              f"| Error Rate | {fmt_pct(stat('http_req_failed', 'rate'))} | < 0.1% |",
+              f"| Throughput | {stat('http_reqs', 'rate'):.1f} req/s | > 50 req/s |",
+              f"| Total Requests | {int(stat('http_reqs', 'count'))} | — |",
+          ]
+
+          report = "\n".join(lines)
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
+              f.write(report + "\n")
+          print(report)
+          EOF
+          fi
+
+      - name: Comment on PR
+        if: github.event_name == 'pull_request' && always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const summaryPath = `results/run_${{ github.run_number }}/summary.json`;
+            if (!fs.existsSync(summaryPath)) return;
+
+            const summary = JSON.parse(fs.readFileSync(summaryPath, 'utf8'));
+            const m = summary.metrics || {};
+            const stat = (metric, field) =>
+              m[metric]?.values?.[field] ?? 'N/A';
+
+            const body = [
+              `## Performance Test Results — Run #${{ github.run_number }}`,
+              `**Scenario:** ${{ env.SCENARIO }} | **Env:** ${{ env.TARGET_ENV }}`,
+              '',
+              '| Metric | Value |',
+              '|--------|-------|',
+              `| P95 | ${(stat('http_req_duration', 'p(95)') || 0).toFixed(0)}ms |`,
+              `| P99 | ${(stat('http_req_duration', 'p(99)') || 0).toFixed(0)}ms |`,
+              `| Error Rate | ${((stat('http_req_failed', 'rate') || 0) * 100).toFixed(3)}% |`,
+              `| Throughput | ${(stat('http_reqs', 'rate') || 0).toFixed(1)} req/s |`,
+            ].join('\n');
+
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body,
+            });
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: perf-results-${{ github.run_number }}-${{ env.SCENARIO }}
+          path: results/run_${{ github.run_number }}/
+          retention-days: 30
+
+      - name: Save baseline history (cache)
+        if: success()
+        uses: actions/cache@v4
+        with:
+          path: results/baseline_history.json
+          key: baseline-history-${{ env.TARGET_ENV }}-${{ env.SCENARIO }}-${{ github.run_number }}
+
+      - name: Notify Slack on failure
+        if: failure() && github.event_name != 'pull_request'
+        uses: slackapi/slack-github-action@v1
+        with:
+          channel-id: '#performance-alerts'
+          slack-message: |
+            :red_circle: *Performance test FAILED*
+            Scenario: `${{ env.SCENARIO }}` | Env: `${{ env.TARGET_ENV }}`
+            Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+
+  # ─────────────────────────────────────────────
+  # Job 3: Publish results to GitHub Pages
+  # ─────────────────────────────────────────────
+  publish-results:
+    name: Publish to GitHub Pages
+    runs-on: ubuntu-latest
+    needs: run-perf-tests
+    if: success() && github.ref == 'refs/heads/main'
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: perf-results-${{ github.run_number }}-${{ github.event.inputs.scenario || 'load' }}
+          path: public/
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: public/
+
+      - uses: actions/deploy-pages@v4
